@@ -2,3 +2,6 @@
 dist/
 .DS_Store
 .claude/
+.agents/
+.codegraph/
+Fusion Client Downloader.dmg

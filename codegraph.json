@@ -1,0 +1,11 @@
+{
+  "//": "CodeGraph index config. CodeGraph already excludes node_modules/.venv/dist/build/.next and respects .gitignore. Repo-specific excludes below keep the symbol graph focused on Sources/CopyWatch.",
+  "exclude": [
+    ".build/**",
+    "dist/**",
+    "*.dmg",
+    "*.png",
+    "*.jpeg",
+    "*.icns"
+  ]
+}

@@ -8,6 +8,14 @@ let package = Package(
         .executableTarget(
             name: "CopyWatch",
             path: "Sources/CopyWatch",
+            exclude: [
+                "App/AGENTS.md",
+                "Engine/AGENTS.md",
+                "Models/AGENTS.md",
+                "Store/AGENTS.md",
+                "System/AGENTS.md",
+                "Views/AGENTS.md",
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
