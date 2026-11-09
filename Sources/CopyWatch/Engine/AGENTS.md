@@ -30,6 +30,9 @@ MHL manifests, benchmarks).
 - Long-running operations must report progress in a way `Store` can persist as
   a resumable snapshot — don't add a copy path that can't be interrupted and
   resumed.
+- Progress snapshots must stay independent of the file count: `emit` strips the
+  manifest, finished rows leave in batches via `onFilesChanged`, and
+  `emit(force: true)` is for job status changes only.
 - Checksums, not size/mtime, are the correctness signal; any cheaper shortcut
   needs an explicit user-facing toggle, not a silent default change.
 
