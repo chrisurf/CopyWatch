@@ -135,6 +135,106 @@ final class ManifestTests: XCTestCase {
         XCTAssertNotNil(manifests.load(id)?.first?.checksum)
     }
 
+    private func tree(_ count: Int, name: String) throws -> URL {
+        let source = root.appendingPathComponent(name)
+        for i in 0..<count {
+            let dir = source.appendingPathComponent("d\(i % 10)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data("file \(i)".utf8).write(to: dir.appendingPathComponent("f\(i).txt"))
+        }
+        return source
+    }
+
+    private func prepare(_ source: URL, store: JobStore) throws -> CopyJob {
+        let parent = root.appendingPathComponent("dst-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        var job = makeJob(source: source.path, dest: parent.appendingPathComponent("out").path)
+        let scanned = try Scanner.scan(root: source)
+        try store.manifests.replace(job.id, records: scanned)
+        job.totalFiles = scanned.count
+        job.totalBytes = scanned.reduce(0) { $0 + $1.size }
+        job.status = .ready
+        return job
+    }
+
+    /// Runs `job` until it stops; `pauseAfter` pauses at the first snapshot
+    /// showing that many finished files.
+    private func run(
+        _ job: CopyJob, store: JobStore, workers: Int, pauseAfter: Int? = nil
+    ) -> CopyJob {
+        let manifests = store.manifests
+        let id = job.id
+        let stopped = expectation(description: "stopped")
+        stopped.assertForOverFulfill = false
+        let lock = NSLock()
+        var last = job
+        var engine: JobEngine?
+        engine = JobEngine(
+            job: job, loadManifest: { manifests.load(id) },
+            onFilesChanged: { manifests.apply(id, changes: $0) }, fileWorkers: workers
+        ) { snapshot in
+            lock.lock(); last = snapshot; let current = engine; lock.unlock()
+            if let pauseAfter, snapshot.status == .running, snapshot.doneFiles >= pauseAfter {
+                current?.pause()
+            }
+            switch snapshot.status {
+            case .completed, .completedWithErrors, .paused, .interrupted, .waitingForVolume:
+                stopped.fulfill()
+            default: break
+            }
+        }
+        engine?.start()
+        wait(for: [stopped], timeout: 120)
+        return last
+    }
+
+    func testParallelAndSerialProduceTheSameManifest() throws {
+        let source = try tree(150, name: "src")
+        let big = source.appendingPathComponent("big.bin")
+        try Data(count: Int(JobEngine.smallFileLimit) + 1).write(to: big)
+
+        let store = JobStore(root: root.appendingPathComponent("store"))
+        let parallel = try prepare(source, store: store)
+        let serial = try prepare(source, store: store)
+        XCTAssertEqual(run(parallel, store: store, workers: 8).status, .completed)
+        XCTAssertEqual(run(serial, store: store, workers: 1).status, .completed)
+
+        let a = try XCTUnwrap(store.manifests.load(parallel.id))
+        let b = try XCTUnwrap(store.manifests.load(serial.id))
+        XCTAssertEqual(a.map(\.status), Array(repeating: .verified, count: 151))
+        XCTAssertEqual(a.map(\.checksum), b.map(\.checksum))
+        XCTAssertEqual(a.map(\.bytesCopied), a.map(\.size))
+
+        let fm = FileManager.default
+        for record in a {
+            let copy = URL(fileURLWithPath: parallel.destPath).appendingPathComponent(record.relativePath)
+            let original = source.appendingPathComponent(record.relativePath)
+            XCTAssertTrue(fm.contentsEqual(atPath: copy.path, andPath: original.path), record.relativePath)
+            let mtime = try fm.attributesOfItem(atPath: copy.path)[.modificationDate] as? Date
+            XCTAssertEqual(mtime, record.modificationDate)
+        }
+    }
+
+    func testPauseThenResumeFinishesEveryFile() throws {
+        let source = try tree(6000, name: "src")
+        let store = JobStore(root: root.appendingPathComponent("store"))
+        let job = try prepare(source, store: store)
+
+        let paused = run(job, store: store, workers: 8, pauseAfter: 50)
+        XCTAssertEqual(paused.status, .paused)
+        XCTAssertEqual(store.manifests.counters(job.id).failedFiles, 0)
+        // Nothing the manifest calls copied may be left unverified.
+        XCTAssertEqual(store.manifests.count(job.id, status: .copied), 0)
+
+        var resumed = paused
+        resumed.status = .interrupted
+        let finished = run(resumed, store: store, workers: 8)
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertEqual(finished.doneFiles, 6000)
+        XCTAssertEqual(store.manifests.counters(job.id).doneFiles, 6000)
+        XCTAssertEqual(store.manifests.count(job.id, status: .pending), 0)
+    }
+
     private func makeJob(source: String, dest: String) -> CopyJob {
         CopyJob(id: UUID(), name: "test", sourceVolume: .forPath(source),
                 destVolume: .forPath(dest), sourcePath: source, destPath: dest)

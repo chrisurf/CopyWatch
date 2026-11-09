@@ -282,6 +282,13 @@ final class AppState {
         }
     }
 
+    /// Copy small files concurrently. Right for SSDs; spinning disks seek
+    /// themselves slower under it. Applies from the next job start.
+    var copySmallFilesInParallel: Bool = UserDefaults.standard.object(
+        forKey: "copySmallFilesInParallel") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(copySmallFilesInParallel, forKey: "copySmallFilesInParallel") }
+    }
+
     private var isSomeJobCopying: Bool {
         jobs.contains { $0.status == .running }
     }
@@ -329,7 +336,8 @@ final class AppState {
             engine = JobEngine(
                 job: job,
                 loadManifest: { manifests.load(jobID) },
-                onFilesChanged: { manifests.apply(jobID, changes: $0) }
+                onFilesChanged: { manifests.apply(jobID, changes: $0) },
+                fileWorkers: copySmallFilesInParallel ? JobEngine.defaultFileWorkers : 1
             ) { [weak self] snapshot in
                 // Timestamp at emit so we can measure how long the update waits
                 // to reach the main actor (the "why isn't the UI instant?" lag).

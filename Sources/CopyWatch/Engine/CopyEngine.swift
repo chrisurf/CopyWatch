@@ -13,6 +13,9 @@ final class JobEngine: @unchecked Sendable {
     private let onFilesChanged: (@Sendable ([FileChange]) -> Void)?
     private var changedFiles = IndexSet()
     private var lastFileFlush = Date.distantPast
+    private let fileWorkers: Int
+    /// `stopIntent` for threads outside the engine's task.
+    private let stopRequested = StopFlag()
 
     private var task: Task<Void, Never>?
     private enum StopIntent { case pause, cancel, waitForVolume }
@@ -24,15 +27,23 @@ final class JobEngine: @unchecked Sendable {
 
     static let chunkSize = FileHasher.chunkSize
     static let partSuffix = ".cwpart"
+    static let defaultFileWorkers = min(8, ProcessInfo.processInfo.activeProcessorCount)
+    /// Files below this size are copied by the parallel workers.
+    static let smallFileLimit: Int64 = 32 * 1024 * 1024
+    /// One batch ends with one drive flush, then its files are verified.
+    private static let batchFileLimit = 200
+    private static let batchByteLimit: Int64 = 512 * 1024 * 1024
 
     /// `loadManifest` supplies the manifest when `job` arrives without one.
     init(
         job: CopyJob,
         loadManifest: (@Sendable () -> [FileRecord]?)? = nil,
         onFilesChanged: (@Sendable ([FileChange]) -> Void)? = nil,
+        fileWorkers: Int = JobEngine.defaultFileWorkers,
         onUpdate: @escaping @Sendable (CopyJob) -> Void
     ) {
         self.job = job
+        self.fileWorkers = fileWorkers
         self.loadManifest = loadManifest
         self.onFilesChanged = onFilesChanged
         self.onUpdate = onUpdate
@@ -45,6 +56,7 @@ final class JobEngine: @unchecked Sendable {
     func start() {
         guard task == nil else { return }
         stopIntent = nil
+        stopRequested.set(false)
         task = Task.detached(priority: .userInitiated) { [self] in
             await run()
             task = nil
@@ -59,6 +71,7 @@ final class JobEngine: @unchecked Sendable {
     private func stop(_ intent: StopIntent) {
         if task != nil {
             stopIntent = intent
+            stopRequested.set(true)
             task?.cancel()
         } else {
             // Not running (e.g. ready/interrupted): apply state directly.
@@ -147,6 +160,12 @@ final class JobEngine: @unchecked Sendable {
         speedSamples.removeAll()
         job.speedHistory.removeAll()   // this run's own throughput profile
         emit(force: true)
+
+        // Small files first, in parallel; the loop below takes what remains.
+        if destRoots.count == 1, fileWorkers > 1,
+           !copySmallFiles(srcRoot: srcRoot, destRoot: destRoots[0]) {
+            return
+        }
 
         for i in job.files.indices where !job.files[i].isDone && job.files[i].status != .failed {
             do {
@@ -293,6 +312,218 @@ final class JobEngine: @unchecked Sendable {
         }
         changedFiles.insert(index)
         emit()
+    }
+
+    // MARK: Small files in parallel
+
+    /// Copy every pending small file in batches. Workers only touch the disk;
+    /// results are merged here, so job state stays single-threaded. Returns
+    /// false when the run has ended (stopped, drive gone, destination full).
+    private func copySmallFiles(srcRoot: URL, destRoot: URL) -> Bool {
+        var next = 0
+        while true {
+            var batch: [Int] = []
+            var batchBytes: Int64 = 0
+            while next < job.files.count, batch.count < Self.batchFileLimit,
+                  batchBytes < Self.batchByteLimit {
+                let file = job.files[next]
+                if !file.isDone, file.status != .failed, file.size < Self.smallFileLimit {
+                    batch.append(next)
+                    batchBytes += file.size
+                }
+                next += 1
+            }
+            if batch.isEmpty { return true }
+            if !runBatch(batch, srcRoot: srcRoot, destRoot: destRoot) { return false }
+            if stopRequested.isSet {
+                finishStopped()
+                return false
+            }
+        }
+    }
+
+    private func runBatch(_ batch: [Int], srcRoot: URL, destRoot: URL) -> Bool {
+        let records = batch.map { job.files[$0] }
+        let run = BatchRun(count: records.count)
+        let directories = DirectoryCache()
+        let (algorithm, verify, stop) = (job.checksumAlgorithm, job.verifyAfterCopy, stopRequested)
+        let (baseBytes, baseFiles) = (job.doneBytes, job.doneFiles)
+        let queue = DispatchQueue(
+            label: "copywatch.smallfiles", qos: .userInitiated, attributes: .concurrent)
+
+        // Waits for the workers while keeping progress and speed moving.
+        func runWorkers(_ body: @escaping @Sendable (Int) -> Void) {
+            let group = DispatchGroup()
+            run.rewind()
+            for _ in 0..<fileWorkers {
+                queue.async(group: group) { while let i = run.claim() { body(i) } }
+            }
+            var finished = false
+            var shownBytes: Int64 = 0
+            while !finished {
+                finished = group.wait(timeout: .now() + .milliseconds(200)) == .success
+                let (bytes, files, current) = run.progress
+                recordSpeed(delta: bytes - shownBytes)
+                shownBytes = bytes
+                job.doneBytes = baseBytes + bytes
+                job.doneFiles = baseFiles + files
+                if let current { job.currentFile = records[current].relativePath }
+                emit()
+            }
+        }
+
+        runWorkers { i in
+            guard !stop.isSet else { return }
+            run.setCopy(i, Result {
+                try Self.copySmallFile(
+                    records[i], srcRoot: srcRoot, destRoot: destRoot, algorithm: algorithm,
+                    flushToDrive: verify, directories: directories, stop: stop
+                ) { run.addBytes($0, startedFile: i) }
+            })
+            run.finishFile()
+        }
+        let copied = (0..<records.count).filter { (try? run.copies[$0]?.get()) != nil }
+
+        // A batch that started is always verified, even when stopping, so no
+        // file is left copied but unchecked.
+        if verify, let first = copied.first {
+            Self.flushDriveCache(through: destRoot.appendingPathComponent(records[first].relativePath))
+            job.currentFile = "Verifying: \(copied.count) files"
+            runWorkers { i in
+                guard let source = try? run.copies[i]?.get() else { return }
+                run.setVerify(i, Result {
+                    let dest = destRoot.appendingPathComponent(records[i].relativePath)
+                    return try FileHasher.hash(of: dest, algorithm: algorithm, bypassCache: true) == source
+                })
+            }
+        }
+
+        job.doneBytes = baseBytes
+        job.doneFiles = baseFiles
+        return merge(run, batch: batch, records: records, srcRoot: srcRoot, destRoot: destRoot)
+    }
+
+    private func merge(
+        _ run: BatchRun, batch: [Int], records: [FileRecord], srcRoot: URL, destRoot: URL
+    ) -> Bool {
+        var vanished: CopyDiagnosis?
+        var halted: CopyDiagnosis?
+
+        func fail(_ index: Int, _ error: Error) {
+            if vanished != nil { return }
+            if volumeVanished(srcRoot: srcRoot, destRoots: [destRoot]) {
+                vanished = CopyDiagnosis.diagnose(error, volumeVanished: true)
+                return
+            }
+            let diag = CopyDiagnosis.diagnose(error, path: job.files[index].relativePath)
+            if diag.haltsTransfer {
+                halted = halted ?? diag
+                return
+            }
+            job.files[index].applyFailure(diag)
+            job.failedFiles += 1
+            changedFiles.insert(index)
+        }
+
+        for (i, index) in batch.enumerated() {
+            guard let copy = run.copies[i] else { continue }
+            let source: String
+            do { source = try copy.get() } catch is CancellationError { continue } catch {
+                fail(index, error)
+                continue
+            }
+            job.files[index].checksum = source
+            setBytesCopied(index, records[i].size)
+            if job.verifyAfterCopy {
+                do {
+                    guard try run.verifies[i]?.get() == true else {
+                        job.files[index].applyFailure(Self.verificationFailure())
+                        job.failedFiles += 1
+                        setBytesCopied(index, 0)
+                        try? FileManager.default.removeItem(
+                            at: destRoot.appendingPathComponent(records[i].relativePath))
+                        changedFiles.insert(index)
+                        continue
+                    }
+                } catch {
+                    setBytesCopied(index, 0)
+                    fail(index, error)
+                    continue
+                }
+                job.files[index].status = .verified
+                job.verifiedFiles += 1
+            } else {
+                job.files[index].status = .copied
+            }
+            job.doneFiles += 1
+            changedFiles.insert(index)
+        }
+        emit()
+
+        if let vanished {
+            finishWaiting(vanished.fix)
+            return false
+        }
+        if let halted {
+            finishInterrupted(halted)
+            return false
+        }
+        return true
+    }
+
+    /// One small file, start to finish, without touching job state. Always
+    /// starts fresh: at this size, redoing it beats validating a partial.
+    private static func copySmallFile(
+        _ record: FileRecord, srcRoot: URL, destRoot: URL, algorithm: ChecksumAlgorithm,
+        flushToDrive: Bool, directories: DirectoryCache, stop: StopFlag,
+        onBytes: (Int64) -> Void
+    ) throws -> String {
+        let srcURL = srcRoot.appendingPathComponent(record.relativePath)
+        let destURL = destRoot.appendingPathComponent(record.relativePath)
+        let partURL = destURL.appendingPathExtension(String(partSuffix.dropFirst()))
+        let fm = FileManager.default
+
+        try directories.ensure(destURL.deletingLastPathComponent())
+        let source = try FileHandle(forReadingFrom: srcURL)
+        defer { try? source.close() }
+        fm.createFile(atPath: partURL.path, contents: nil)
+        let dest = try FileHandle(forWritingTo: partURL)
+        defer { try? dest.close() }
+
+        var hasher = algorithm.makeHasher()
+        let readSize = Int(max(1, min(record.size + 1, Int64(chunkSize))))
+        var reading = true
+        while reading {
+            if stop.isSet { throw CancellationError() }
+            reading = try autoreleasepool {
+                guard let chunk = try source.read(upToCount: readSize), !chunk.isEmpty else {
+                    return false
+                }
+                hasher.update(chunk)
+                try dest.write(contentsOf: chunk)
+                onBytes(Int64(chunk.count))
+                return true
+            }
+        }
+        // Into the drive's cache; the batch flush then empties that once.
+        if flushToDrive { _ = fsync(dest.fileDescriptor) }
+        try dest.close()
+
+        try? fm.setAttributes([.modificationDate: record.modificationDate], ofItemAtPath: partURL.path)
+        guard rename(partURL.path, destURL.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        copyMetadata(from: srcURL, to: destURL)
+        return hasher.finalizedHex()
+    }
+
+    /// `F_FULLFSYNC` empties the whole drive's write cache, whichever file it
+    /// is issued through, so one call covers every file in the batch.
+    private static func flushDriveCache(through file: URL) {
+        let fd = open(file.path, O_RDWR)
+        guard fd >= 0 else { return }
+        _ = fcntl(fd, F_FULLFSYNC, 0)
+        close(fd)
     }
 
     static func verificationFailure(at destination: String? = nil) -> CopyDiagnosis {
@@ -827,6 +1058,68 @@ private final class ChunkPipe: @unchecked Sendable {
 
     func finish() { cond.lock(); closed = true; cond.broadcast(); cond.unlock() }
     func abort() { cond.lock(); aborted = true; cond.broadcast(); cond.unlock() }
+}
+
+/// One-way stop signal readable from any thread.
+private final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ newValue: Bool) { lock.lock(); value = newValue; lock.unlock() }
+}
+
+/// Creates each destination folder once per batch instead of once per file.
+private final class DirectoryCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var created = Set<URL>()
+
+    func ensure(_ directory: URL) throws {
+        lock.lock()
+        let known = created.contains(directory)
+        lock.unlock()
+        if known { return }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        lock.lock()
+        created.insert(directory)
+        lock.unlock()
+    }
+}
+
+/// Work queue and results of one batch, shared with its workers.
+private final class BatchRun: @unchecked Sendable {
+    private let lock = NSLock()
+    private let count: Int
+    private var next = 0
+    private var bytes: Int64 = 0
+    private var files = 0
+    private var current: Int?
+    private(set) var copies: [Result<String, Error>?]
+    private(set) var verifies: [Result<Bool, Error>?]
+
+    init(count: Int) {
+        self.count = count
+        copies = Array(repeating: nil, count: count)
+        verifies = Array(repeating: nil, count: count)
+    }
+
+    func rewind() { lock.lock(); next = 0; lock.unlock() }
+
+    func claim() -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        guard next < count else { return nil }
+        next += 1
+        return next - 1
+    }
+
+    func setCopy(_ i: Int, _ result: Result<String, Error>) { lock.lock(); copies[i] = result; lock.unlock() }
+    func setVerify(_ i: Int, _ result: Result<Bool, Error>) { lock.lock(); verifies[i] = result; lock.unlock() }
+    func addBytes(_ n: Int64, startedFile i: Int) { lock.lock(); bytes += n; current = i; lock.unlock() }
+    func finishFile() { lock.lock(); files += 1; lock.unlock() }
+
+    var progress: (bytes: Int64, files: Int, current: Int?) {
+        lock.lock(); defer { lock.unlock() }
+        return (bytes, files, current)
+    }
 }
 
 /// Thread-safe holder for the first error seen across concurrent destination writes.

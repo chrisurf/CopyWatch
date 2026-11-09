@@ -33,6 +33,9 @@ MHL manifests, benchmarks).
 - Progress snapshots must stay independent of the file count: `emit` strips the
   manifest, finished rows leave in batches via `onFilesChanged`, and
   `emit(force: true)` is for job status changes only.
+- Parallel small-file workers only touch the disk; job state is merged on the
+  engine's own thread. A batch's single `F_FULLFSYNC` must precede its verify
+  reads, and a started batch is always verified.
 - Checksums, not size/mtime, are the correctness signal; any cheaper shortcut
   needs an explicit user-facing toggle, not a silent default change.
 
