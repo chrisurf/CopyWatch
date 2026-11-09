@@ -4,10 +4,15 @@ import Foundation
 /// pause/cancel, mid-file resume, and rescue of partial (Finder) copies.
 ///
 /// All mutation happens on the engine's own task; progress leaves via
-/// `onUpdate` snapshots (the caller decides threading and persistence).
+/// `onUpdate` snapshots, which never carry the manifest, and `onFilesChanged`
+/// batches of finished rows (the caller decides threading and persistence).
 final class JobEngine: @unchecked Sendable {
     private(set) var job: CopyJob
     private let onUpdate: @Sendable (CopyJob) -> Void
+    private let loadManifest: (@Sendable () -> [FileRecord]?)?
+    private let onFilesChanged: (@Sendable ([FileChange]) -> Void)?
+    private var changedFiles = IndexSet()
+    private var lastFileFlush = Date.distantPast
 
     private var task: Task<Void, Never>?
     private enum StopIntent { case pause, cancel, waitForVolume }
@@ -20,8 +25,16 @@ final class JobEngine: @unchecked Sendable {
     static let chunkSize = FileHasher.chunkSize
     static let partSuffix = ".cwpart"
 
-    init(job: CopyJob, onUpdate: @escaping @Sendable (CopyJob) -> Void) {
+    /// `loadManifest` supplies the manifest when `job` arrives without one.
+    init(
+        job: CopyJob,
+        loadManifest: (@Sendable () -> [FileRecord]?)? = nil,
+        onFilesChanged: (@Sendable ([FileChange]) -> Void)? = nil,
+        onUpdate: @escaping @Sendable (CopyJob) -> Void
+    ) {
         self.job = job
+        self.loadManifest = loadManifest
+        self.onFilesChanged = onFilesChanged
         self.onUpdate = onUpdate
     }
 
@@ -106,6 +119,14 @@ final class JobEngine: @unchecked Sendable {
             }
         }
 
+        if job.files.isEmpty, let loaded = loadManifest?() { job.files = loaded }
+        guard job.files.count == job.totalFiles else {
+            job.currentFile = nil
+            job.status = .interrupted
+            job.statusMessage = "This job's file list could not be read, so nothing was copied."
+            return emit(force: true)
+        }
+
         // A file interrupted mid-copy resumes from its partial data.
         for i in job.files.indices where job.files[i].status == .copying {
             job.files[i].status = .pending
@@ -121,6 +142,7 @@ final class JobEngine: @unchecked Sendable {
             : "Checking what's already at the destination…"
         emit(force: true)
         Reconciler.reconcile(job: &job, destRoots: destRoots, sourceRoot: srcRoot, deep: true)
+        for i in job.files.indices where job.files[i].status == .skipped { changedFiles.insert(i) }
         job.statusMessage = nil
         speedSamples.removeAll()
         job.speedHistory.removeAll()   // this run's own throughput profile
@@ -152,7 +174,8 @@ final class JobEngine: @unchecked Sendable {
                 }
                 job.files[i].applyFailure(diag)
                 job.failedFiles += 1
-                emit(force: true)
+                changedFiles.insert(i)
+                emit()
             }
         }
 
@@ -177,7 +200,7 @@ final class JobEngine: @unchecked Sendable {
 
         job.files[index].status = .copying
         job.currentFile = record.relativePath
-        emit(force: true)
+        emit()
 
         try fm.createDirectory(
             at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -247,7 +270,7 @@ final class JobEngine: @unchecked Sendable {
 
         if job.verifyAfterCopy {
             job.currentFile = "Verifying: \(record.relativePath)"
-            emit(force: true)
+            emit()
             let vT = DispatchTime.now().uptimeNanoseconds
             let destHash = try FileHasher.hash(
                 of: destURL, algorithm: job.checksumAlgorithm, bypassCache: true)
@@ -268,7 +291,8 @@ final class JobEngine: @unchecked Sendable {
                 try? fm.removeItem(at: destURL)
             }
         }
-        emit(force: true)
+        changedFiles.insert(index)
+        emit()
     }
 
     static func verificationFailure(at destination: String? = nil) -> CopyDiagnosis {
@@ -295,13 +319,14 @@ final class JobEngine: @unchecked Sendable {
             job.files[index].status = job.verifyAfterCopy ? .verified : .copied
             job.doneFiles += 1
             if job.verifyAfterCopy { job.verifiedFiles += 1 }
-            emit(force: true)
+            changedFiles.insert(index)
+            emit()
             return
         }
 
         job.files[index].status = .copying
         job.currentFile = "\(record.relativePath) → \(needed.count) drive\(needed.count == 1 ? "" : "s")"
-        emit(force: true)
+        emit()
 
         // Prepare a .cwpart per needed destination, adopting any partial leftover.
         var partURLs: [URL] = []
@@ -384,7 +409,7 @@ final class JobEngine: @unchecked Sendable {
 
             if job.verifyAfterCopy {
                 job.currentFile = "Verifying: \(record.relativePath)"
-                emit(force: true)
+                emit()
                 let destHash = try FileHasher.hash(
                     of: destURL, algorithm: job.checksumAlgorithm, bypassCache: true)
                 if destHash != sourceHash {
@@ -392,7 +417,8 @@ final class JobEngine: @unchecked Sendable {
                     setBytesCopied(index, 0)
                     try? fm.removeItem(at: destURL)
                     job.failedFiles += 1
-                    emit(force: true)
+                    changedFiles.insert(index)
+                    emit()
                     return
                 }
             }
@@ -401,7 +427,8 @@ final class JobEngine: @unchecked Sendable {
         job.files[index].status = job.verifyAfterCopy ? .verified : .copied
         job.doneFiles += 1
         if job.verifyAfterCopy { job.verifiedFiles += 1 }
-        emit(force: true)
+        changedFiles.insert(index)
+        emit()
     }
 
     /// Longest byte prefix that matches the source in EVERY part file. Reads the
@@ -609,7 +636,7 @@ final class JobEngine: @unchecked Sendable {
         try srcHandle.seek(toOffset: 0)
 
         job.currentFile = "Resuming: \(job.files[fileIndex].relativePath)"
-        emit(force: true)
+        emit()
 
         var verified: Int64 = 0
         enum Step { case done, mismatch, more(Int64) }
@@ -683,13 +710,28 @@ final class JobEngine: @unchecked Sendable {
         }
     }
 
+    /// `force` is for job status changes only: per-file events go through the
+    /// 2 Hz throttle, so update traffic can't scale with the file count.
     private func emit(force: Bool = false) {
-        // 2 Hz keeps progress lively without re-rendering large manifests
-        // (sidebar + file table) faster than the eye needs.
+        flushFileChanges(force: force)
         let now = Date()
         guard force || now.timeIntervalSince(lastEmit) > 0.5 else { return }
         lastEmit = now
-        onUpdate(job)
+        var snapshot = job
+        snapshot.files = []
+        onUpdate(snapshot)
+    }
+
+    /// Hand finished rows to the caller in batches: few enough transactions to
+    /// keep write load low, frequent enough that a crash repeats only seconds.
+    private func flushFileChanges(force: Bool) {
+        guard !changedFiles.isEmpty else { return }
+        let now = Date()
+        guard force || changedFiles.count >= 500
+                || now.timeIntervalSince(lastFileFlush) >= 2 else { return }
+        lastFileFlush = now
+        onFilesChanged?(changedFiles.map { FileChange(index: $0, record: job.files[$0]) })
+        changedFiles.removeAll()
     }
 
     private func finishStopped() {

@@ -59,9 +59,16 @@ enum Headless {
         job.totalBytes = job.files.reduce(0) { $0 + $1.size }
         job.status = .ready
         print("Manifest: \(job.totalFiles) files, \(Format.bytes(job.totalBytes))")
+        do {
+            try store.manifests.replace(job.id, records: job.files)
+        } catch {
+            print("Could not store the manifest: \(error)")
+            exit(1)
+        }
 
         let done = DispatchSemaphore(value: 0)
-        let engine = JobEngine(job: job) { snapshot in
+        let jobID = job.id
+        let engine = JobEngine(job: job, onFilesChanged: { store.manifests.apply(jobID, changes: $0) }) { snapshot in
             store.save(snapshot, force: !snapshot.status.isActive)
             if let current = snapshot.currentFile {
                 print("[\(Int(snapshot.fractionDone * 100))%] " +
@@ -80,6 +87,7 @@ enum Headless {
 
         let final = engine.job
         store.save(final, force: true)
+        store.manifests.close(jobID)
         var certLine = ""
         if final.status == .completed || final.status == .completedWithErrors {
             let url = Certificate.generate(for: final)
